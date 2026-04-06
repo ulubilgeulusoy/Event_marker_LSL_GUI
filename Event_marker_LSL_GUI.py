@@ -1,0 +1,589 @@
+import csv
+import os
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+from pylsl import StreamInfo, StreamOutlet, local_clock
+
+
+# -----------------------------
+# Counterbalancing definitions
+# -----------------------------
+OPTION_DEFINITIONS = {
+    1: {"minutes": 15, "elbows": 2},
+    2: {"minutes": 30, "elbows": 2},
+    3: {"minutes": 15, "elbows": 4},
+    4: {"minutes": 30, "elbows": 4},
+}
+
+# Based on the image you shared
+PARTICIPANT_TRIAL_MAP = {
+    101: [1, 2, 4, 3],
+    102: [2, 3, 1, 4],
+    103: [3, 4, 2, 1],
+    104: [4, 1, 3, 2],
+    105: [1, 2, 4, 3],
+    106: [2, 3, 1, 4],
+    107: [3, 4, 2, 1],
+    108: [4, 1, 3, 2],
+    109: [1, 2, 4, 3],
+    110: [2, 3, 1, 4],
+}
+
+
+class ExperimentMarkerGUI:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Experiment LSL Marker GUI")
+        self.root.geometry("1200x780")
+
+        # -----------------------------
+        # LSL outlet starts immediately
+        # -----------------------------
+        self.stream_name = "ExperimentMarkers"
+        self.stream_type = "Markers"
+        self.source_id = f"experiment-markers-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+        info = StreamInfo(
+            self.stream_name,
+            self.stream_type,
+            1,
+            0,  # irregular event stream
+            "string",
+            self.source_id,
+        )
+        self.outlet = StreamOutlet(info)
+
+        # -----------------------------
+        # State
+        # -----------------------------
+        self.participant_id = None
+        self.trial_sequence = []
+        self.current_trial_index = 0  # 0-based, so trial number is +1
+        self.trial_active = False
+        self.timer_running = False
+        self.remaining_seconds = 0
+        self.timer_job = None
+
+        # local backup log
+        self.log_file = self._create_log_file()
+
+        # -----------------------------
+        # UI variables
+        # -----------------------------
+        self.participant_var = tk.StringVar()
+        self.participant_status_var = tk.StringVar(value="No participant loaded.")
+        self.current_trial_var = tk.StringVar(value="Trial: -")
+        self.time_var = tk.StringVar(value="Allocated Time: -")
+        self.elbow_var = tk.StringVar(value="Configuration: -")
+        self.timer_var = tk.StringVar(value="00:00")
+        self.last_marker_var = tk.StringVar(value="Last Marker: None")
+        self.custom_event_var = tk.StringVar()
+        self.note_var = tk.StringVar()
+
+        self.briefing_active = False
+        self.baseline_active = False
+        self.notes_file = None
+
+        self._build_ui()
+
+        # Send app-start marker
+        self.send_marker("gui_started")
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # -----------------------------
+    # File logging
+    # -----------------------------
+    def _create_log_file(self) -> str:
+        logs_dir = "marker_logs"
+        os.makedirs(logs_dir, exist_ok=True)
+        filename = datetime.now().strftime("marker_log_%Y%m%d_%H%M%S.csv")
+        filepath = os.path.join(logs_dir, filename)
+
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["wall_time", "lsl_time", "marker"])
+
+        return filepath
+
+    def append_local_log(self, marker: str, lsl_time: float) -> None:
+        with open(self.log_file, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now().isoformat(timespec="milliseconds"),
+                f"{lsl_time:.6f}",
+                marker
+            ])
+
+    # -----------------------------
+    # UI
+    # -----------------------------
+    def _build_ui(self) -> None:
+        container = ttk.Frame(self.root)
+        container.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(container, highlightthickness=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        y_scroll = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
+        y_scroll.pack(side="right", fill="y")
+        self.canvas.configure(yscrollcommand=y_scroll.set)
+
+        main = ttk.Frame(self.canvas, padding=12)
+        self.main_window = self.canvas.create_window((0, 0), window=main, anchor="nw")
+        main.bind("<Configure>", self._on_main_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        # Top frame
+        top = ttk.Frame(main)
+        top.pack(fill="x", pady=(0, 10))
+
+        participant_frame = ttk.LabelFrame(top, text="Participant Setup", padding=10)
+        participant_frame.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        ttk.Label(participant_frame, text="Participant ID:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        ttk.Entry(participant_frame, textvariable=self.participant_var, width=15).grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        ttk.Button(participant_frame, text="Load Participant", command=self.load_participant).grid(row=0, column=2, sticky="w", padx=5, pady=5)
+
+        ttk.Label(participant_frame, textvariable=self.participant_status_var).grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+
+        info_frame = ttk.LabelFrame(top, text="Current Trial Info", padding=10)
+        info_frame.pack(side="left", fill="x", expand=True)
+
+        ttk.Label(info_frame, textvariable=self.current_trial_var, font=("Arial", 12, "bold")).grid(row=0, column=0, sticky="w", padx=5, pady=4)
+        ttk.Label(info_frame, textvariable=self.time_var, font=("Arial", 12)).grid(row=1, column=0, sticky="w", padx=5, pady=4)
+        ttk.Label(info_frame, textvariable=self.elbow_var, font=("Arial", 12)).grid(row=2, column=0, sticky="w", padx=5, pady=4)
+
+        timer_frame = ttk.LabelFrame(main, text="Timer", padding=10)
+        timer_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(timer_frame, textvariable=self.timer_var, font=("Arial", 28, "bold")).pack(anchor="center", pady=5)
+
+        # General event buttons
+        general_frame = ttk.LabelFrame(main, text="General Events", padding=10)
+        general_frame.pack(fill="x", pady=(0, 10))
+
+        self.briefing_start_btn = ttk.Button(general_frame, text="Briefing Start", command=self.briefing_start)
+        self.briefing_start_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        self.briefing_end_btn = ttk.Button(general_frame, text="Briefing End", command=self.briefing_end)
+        self.briefing_end_btn.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.baseline_start_btn = ttk.Button(general_frame, text="Baseline Start", command=self.baseline_start)
+        self.baseline_start_btn.grid(row=0, column=2, padx=5, pady=5, sticky="ew")
+        self.baseline_end_btn = ttk.Button(general_frame, text="Baseline End", command=self.baseline_end)
+        self.baseline_end_btn.grid(row=0, column=3, padx=5, pady=5, sticky="ew")
+
+        for i in range(4):
+            general_frame.columnconfigure(i, weight=1)
+
+        # Trial buttons
+        trial_frame = ttk.LabelFrame(main, text="Trial Events", padding=10)
+        trial_frame.pack(fill="x", pady=(0, 10))
+
+        self.trial_start_btn = ttk.Button(
+            trial_frame,
+            text="Trial Start (Leak Check Start)",
+            command=self.start_trial
+        )
+        self.trial_start_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+
+        self.leak_check_end_btn = ttk.Button(
+            trial_frame,
+            text="Leak Check End (Visual Inspection Start)",
+            command=self.leak_check_end
+        )
+        self.leak_check_end_btn.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+
+        self.visual_inspection_end_btn = ttk.Button(
+            trial_frame,
+            text="Visual Inspection End (Reporting Start)",
+            command=self.visual_inspection_end
+        )
+        self.visual_inspection_end_btn.grid(row=0, column=2, padx=5, pady=5, sticky="ew")
+
+        self.trial_end_btn = ttk.Button(
+            trial_frame,
+            text="Trial End (Reporting End)",
+            command=self.end_trial_manual
+        )
+        self.trial_end_btn.grid(row=0, column=3, padx=5, pady=5, sticky="ew")
+
+        for i in range(4):
+            trial_frame.columnconfigure(i, weight=1)
+
+        # Custom event
+        custom_frame = ttk.LabelFrame(main, text="Custom Event", padding=10)
+        custom_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Entry(custom_frame, textvariable=self.custom_event_var).grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        ttk.Button(custom_frame, text="Send Custom Event", command=self.send_custom_event).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        custom_frame.columnconfigure(0, weight=1)
+
+        notes_frame = ttk.LabelFrame(main, text="Researcher Notes (Press Enter to Save)", padding=10)
+        notes_frame.pack(fill="x", pady=(0, 10))
+        self.notes_entry = ttk.Entry(notes_frame, textvariable=self.note_var)
+        self.notes_entry.pack(fill="x")
+        self.notes_entry.bind("<Return>", self.save_note_from_enter)
+
+        # Status / log
+        status_frame = ttk.LabelFrame(main, text="Status", padding=10)
+        status_frame.pack(fill="both", expand=True)
+
+        ttk.Label(status_frame, textvariable=self.last_marker_var, font=("Arial", 11, "bold")).pack(anchor="w", pady=(0, 8))
+
+        self.log_text = tk.Text(status_frame, height=18, wrap="word")
+        self.log_text.pack(fill="both", expand=True)
+        self.log_text.configure(state="disabled")
+
+        self._set_trial_button_states()
+        self._set_general_button_states()
+
+    # -----------------------------
+    # Utility
+    # -----------------------------
+    def _on_main_configure(self, _event=None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event) -> None:
+        self.canvas.itemconfigure(self.main_window, width=event.width)
+
+    def _on_mousewheel(self, event) -> None:
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def log_message(self, text: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", f"[{timestamp}] {text}\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def send_marker(self, marker: str) -> None:
+        lsl_time = local_clock()
+        self.outlet.push_sample([marker], timestamp=lsl_time)
+        self.append_local_log(marker, lsl_time)
+        self.last_marker_var.set(f"Last Marker: {marker}")
+        self.log_message(f"Sent marker: {marker} | LSL time: {lsl_time:.6f}")
+
+    def _format_mmss(self, total_seconds: int) -> str:
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _set_trial_button_states(self) -> None:
+        participant_loaded = self.participant_id is not None
+        more_trials_available = participant_loaded and self.current_trial_index < 4
+
+        if self.trial_active:
+            self.trial_start_btn.config(state="disabled")
+            self.leak_check_end_btn.config(state="normal")
+            self.visual_inspection_end_btn.config(state="normal")
+            self.trial_end_btn.config(state="normal")
+        else:
+            self.trial_start_btn.config(state="normal" if more_trials_available else "disabled")
+            self.leak_check_end_btn.config(state="disabled")
+            self.visual_inspection_end_btn.config(state="disabled")
+            self.trial_end_btn.config(state="disabled")
+
+    def _set_general_button_states(self) -> None:
+        self.briefing_start_btn.config(state="disabled" if self.briefing_active else "normal")
+        self.briefing_end_btn.config(state="normal" if self.briefing_active else "disabled")
+        self.baseline_start_btn.config(state="disabled" if self.baseline_active else "normal")
+        self.baseline_end_btn.config(state="normal" if self.baseline_active else "disabled")
+
+    def _get_current_trial_info(self):
+        if self.participant_id is None or self.current_trial_index >= 4:
+            return None
+
+        trial_number = self.current_trial_index + 1
+        option_number = self.trial_sequence[self.current_trial_index]
+        option_info = OPTION_DEFINITIONS[option_number]
+
+        return {
+            "trial_number": trial_number,
+            "option_number": option_number,
+            "minutes": option_info["minutes"],
+            "elbows": option_info["elbows"],
+        }
+
+    def update_trial_display(self) -> None:
+        info = self._get_current_trial_info()
+        if info is None:
+            self.current_trial_var.set("Trial: Completed / Not Loaded")
+            self.time_var.set("Allocated Time: -")
+            self.elbow_var.set("Configuration: -")
+            if not self.trial_active:
+                self.timer_var.set("00:00")
+            return
+
+        self.current_trial_var.set(f"Trial: {info['trial_number']}")
+        self.time_var.set(f"Allocated Time: {info['minutes']} minutes")
+        self.elbow_var.set(f"Configuration: {info['elbows']} elbows")
+
+    # -----------------------------
+    # Participant loading
+    # -----------------------------
+    def load_participant(self) -> None:
+        raw = self.participant_var.get().strip()
+
+        if not raw.isdigit():
+            messagebox.showerror("Invalid Input", "Participant ID must be numeric.")
+            return
+
+        pid = int(raw)
+
+        if pid not in PARTICIPANT_TRIAL_MAP:
+            messagebox.showerror(
+                "Participant Not Found",
+                "Participant ID is not in the current counterbalancing table.\n"
+                "Currently supported: 101-110."
+            )
+            return
+
+        # Reset current session state for new participant
+        self.stop_timer()
+        self.participant_id = pid
+        self.trial_sequence = PARTICIPANT_TRIAL_MAP[pid]
+        self.current_trial_index = 0
+        self.trial_active = False
+        self.briefing_active = False
+        self.baseline_active = False
+        self.notes_file = self._prepare_notes_file(pid)
+
+        self.participant_status_var.set(
+            f"Participant {pid} loaded. Trial order: {self.trial_sequence}"
+        )
+        self.update_trial_display()
+        self._set_trial_button_states()
+        self._set_general_button_states()
+
+        self.send_marker(f"participant_loaded_p{pid}")
+        self.log_message(f"Loaded participant {pid} with trial order {self.trial_sequence}")
+
+    # -----------------------------
+    # General events
+    # -----------------------------
+    def briefing_start(self) -> None:
+        if self.briefing_active:
+            return
+        self.briefing_active = True
+        self._set_general_button_states()
+        self.general_event("briefing_start")
+
+    def briefing_end(self) -> None:
+        if not self.briefing_active:
+            return
+        self.briefing_active = False
+        self._set_general_button_states()
+        self.general_event("briefing_end")
+
+    def baseline_start(self) -> None:
+        if self.baseline_active:
+            return
+        self.baseline_active = True
+        self._set_general_button_states()
+        self.general_event("baseline_start")
+
+    def baseline_end(self) -> None:
+        if not self.baseline_active:
+            return
+        self.baseline_active = False
+        self._set_general_button_states()
+        self.general_event("baseline_end")
+
+    def general_event(self, event_name: str) -> None:
+        if self.participant_id is not None:
+            marker = f"p{self.participant_id}_{event_name}"
+        else:
+            marker = event_name
+        self.send_marker(marker)
+
+    def _prepare_notes_file(self, participant_id: int) -> str:
+        notes_root = "researcher_notes"
+        participant_dir = os.path.join(notes_root, f"p{participant_id}")
+        os.makedirs(participant_dir, exist_ok=True)
+        filepath = os.path.join(participant_dir, f"p{participant_id}_notes.csv")
+        if not os.path.exists(filepath):
+            with open(filepath, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["wall_time", "participant_id", "note"])
+        return filepath
+
+    def save_note_from_enter(self, _event=None):
+        note = self.note_var.get().strip()
+        if not note:
+            return "break"
+        if self.participant_id is None:
+            messagebox.showwarning("No Participant", "Load a participant before saving notes.")
+            return "break"
+        if self.notes_file is None:
+            self.notes_file = self._prepare_notes_file(self.participant_id)
+
+        with open(self.notes_file, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.now().isoformat(timespec="milliseconds"),
+                self.participant_id,
+                note,
+            ])
+
+        self.log_message(f"Saved note for p{self.participant_id}: {note}")
+        self.note_var.set("")
+        return "break"
+
+    def send_custom_event(self) -> None:
+        text = self.custom_event_var.get().strip()
+        if not text:
+            messagebox.showwarning("Empty Custom Event", "Please enter custom event text.")
+            return
+
+        cleaned = text.lower().replace(" ", "_")
+        if self.participant_id is not None:
+            marker = f"p{self.participant_id}_custom_{cleaned}"
+        else:
+            marker = f"custom_{cleaned}"
+
+        self.send_marker(marker)
+
+    # -----------------------------
+    # Trial lifecycle
+    # -----------------------------
+    def start_trial(self) -> None:
+        if self.participant_id is None:
+            messagebox.showwarning("No Participant", "Load a participant before starting a trial.")
+            return
+
+        if self.trial_active:
+            messagebox.showinfo("Trial Active", "A trial is already running.")
+            return
+
+        info = self._get_current_trial_info()
+        if info is None:
+            messagebox.showinfo("All Trials Completed", "No remaining trials for this participant.")
+            return
+
+        self.trial_active = True
+        self._set_trial_button_states()
+
+        trial_num = info["trial_number"]
+        option_num = info["option_number"]
+        minutes = info["minutes"]
+        elbows = info["elbows"]
+
+        marker = (
+            f"p{self.participant_id}_trial_start_t{trial_num}_"
+            f"option{option_num}_{minutes}min_{elbows}elbows"
+        )
+        self.send_marker(marker)
+        self.log_message(
+            f"Trial {trial_num} started | option={option_num}, duration={minutes} min, elbows={elbows}"
+        )
+
+        self.start_timer(minutes * 60)
+
+    def leak_check_end(self) -> None:
+        if not self.trial_active:
+            messagebox.showwarning("No Active Trial", "Start a trial first.")
+            return
+
+        info = self._get_current_trial_info()
+        if info is None:
+            return
+
+        marker = f"p{self.participant_id}_leak_check_end_t{info['trial_number']}"
+        self.send_marker(marker)
+
+    def visual_inspection_end(self) -> None:
+        if not self.trial_active:
+            messagebox.showwarning("No Active Trial", "Start a trial first.")
+            return
+
+        info = self._get_current_trial_info()
+        if info is None:
+            return
+
+        marker = f"p{self.participant_id}_visual_inspection_end_t{info['trial_number']}"
+        self.send_marker(marker)
+
+    def end_trial_manual(self) -> None:
+        self._end_trial(auto=False)
+
+    def _end_trial(self, auto: bool) -> None:
+        if not self.trial_active:
+            return
+
+        info = self._get_current_trial_info()
+        if info is None:
+            return
+
+        trial_num = info["trial_number"]
+        option_num = info["option_number"]
+        end_kind = "auto" if auto else "manual"
+
+        marker = f"p{self.participant_id}_trial_end_t{trial_num}_option{option_num}_{end_kind}"
+        self.send_marker(marker)
+
+        self.stop_timer()
+        self.trial_active = False
+        self.current_trial_index += 1
+
+        self.update_trial_display()
+        self._set_trial_button_states()
+
+        if self.current_trial_index >= 4:
+            self.log_message("All trials completed for this participant.")
+            messagebox.showinfo("Participant Complete", "All 4 trials are complete.")
+
+    # -----------------------------
+    # Timer
+    # -----------------------------
+    def start_timer(self, seconds: int) -> None:
+        self.stop_timer()
+        self.remaining_seconds = max(0, int(seconds))
+        self.timer_var.set(self._format_mmss(self.remaining_seconds))
+        self.timer_running = True
+        self._tick_timer()
+
+    def stop_timer(self) -> None:
+        self.timer_running = False
+        if self.timer_job is not None:
+            self.root.after_cancel(self.timer_job)
+            self.timer_job = None
+
+    def _tick_timer(self) -> None:
+        if not self.timer_running:
+            return
+
+        self.timer_var.set(self._format_mmss(self.remaining_seconds))
+
+        if self.remaining_seconds <= 0:
+            self.timer_running = False
+            self.timer_job = None
+            self.log_message("Timer reached 00:00. Ending trial automatically.")
+            self._end_trial(auto=True)
+            return
+
+        self.remaining_seconds -= 1
+        self.timer_job = self.root.after(1000, self._tick_timer)
+
+    # -----------------------------
+    # App lifecycle
+    # -----------------------------
+    def on_close(self) -> None:
+        self.stop_timer()
+        try:
+            self.send_marker("gui_closed")
+        except Exception:
+            pass
+        self.root.destroy()
+
+
+def main() -> None:
+    root = tk.Tk()
+    ExperimentMarkerGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
