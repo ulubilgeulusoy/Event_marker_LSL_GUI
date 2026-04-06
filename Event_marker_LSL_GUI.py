@@ -81,6 +81,7 @@ class ExperimentMarkerGUI:
         self.last_marker_var = tk.StringVar(value="Last Marker: None")
         self.custom_event_var = tk.StringVar()
         self.note_var = tk.StringVar()
+        self.session_phase = "idle"
 
         self.briefing_active = False
         self.baseline_active = False
@@ -367,6 +368,7 @@ class ExperimentMarkerGUI:
         if self.briefing_active:
             return
         self.briefing_active = True
+        self.session_phase = "briefing"
         self._set_general_button_states()
         self.general_event("briefing_start")
 
@@ -374,6 +376,7 @@ class ExperimentMarkerGUI:
         if not self.briefing_active:
             return
         self.briefing_active = False
+        self.session_phase = "idle"
         self._set_general_button_states()
         self.general_event("briefing_end")
 
@@ -381,6 +384,7 @@ class ExperimentMarkerGUI:
         if self.baseline_active:
             return
         self.baseline_active = True
+        self.session_phase = "baseline"
         self._set_general_button_states()
         self.general_event("baseline_start")
 
@@ -388,6 +392,7 @@ class ExperimentMarkerGUI:
         if not self.baseline_active:
             return
         self.baseline_active = False
+        self.session_phase = "idle"
         self._set_general_button_states()
         self.general_event("baseline_end")
 
@@ -406,7 +411,20 @@ class ExperimentMarkerGUI:
         if not os.path.exists(filepath):
             with open(filepath, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["wall_time", "participant_id", "note"])
+                writer.writerow(["wall_time", "participant_id", "phase", "note"])
+        else:
+            with open(filepath, "r", newline="", encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+            if rows:
+                header = rows[0]
+                if "phase" not in header:
+                    migrated_rows = [["wall_time", "participant_id", "phase", "note"]]
+                    for row in rows[1:]:
+                        if len(row) >= 3:
+                            migrated_rows.append([row[0], row[1], "", row[2]])
+                    with open(filepath, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerows(migrated_rows)
         return filepath
 
     def save_note_from_enter(self, _event=None):
@@ -424,6 +442,7 @@ class ExperimentMarkerGUI:
             writer.writerow([
                 datetime.now().isoformat(timespec="milliseconds"),
                 self.participant_id,
+                self.session_phase,
                 note,
             ])
 
@@ -463,6 +482,7 @@ class ExperimentMarkerGUI:
             return
 
         self.trial_active = True
+        self.session_phase = f"trial_t{info['trial_number']}_leak_check"
         self._set_trial_button_states()
 
         trial_num = info["trial_number"]
@@ -491,6 +511,7 @@ class ExperimentMarkerGUI:
             return
 
         marker = f"p{self.participant_id}_leak_check_end_t{info['trial_number']}"
+        self.session_phase = f"trial_t{info['trial_number']}_visual_inspection"
         self.send_marker(marker)
 
     def visual_inspection_end(self) -> None:
@@ -503,6 +524,7 @@ class ExperimentMarkerGUI:
             return
 
         marker = f"p{self.participant_id}_visual_inspection_end_t{info['trial_number']}"
+        self.session_phase = f"trial_t{info['trial_number']}_reporting"
         self.send_marker(marker)
 
     def end_trial_manual(self) -> None:
@@ -525,6 +547,7 @@ class ExperimentMarkerGUI:
 
         self.stop_timer()
         self.trial_active = False
+        self.session_phase = "idle"
         self.current_trial_index += 1
 
         self.update_trial_display()
@@ -586,4 +609,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
