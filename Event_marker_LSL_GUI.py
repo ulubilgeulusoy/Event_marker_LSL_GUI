@@ -17,6 +17,8 @@ OPTION_DEFINITIONS = {
     4: {"minutes": 30, "elbows": 4},
 }
 
+BASELINE_SECONDS = 120
+
 # Based on the image you shared
 PARTICIPANT_TRIAL_MAP = {
     101: [1, 2, 4, 3],
@@ -65,6 +67,7 @@ class ExperimentMarkerGUI:
         self.timer_running = False
         self.remaining_seconds = 0
         self.timer_job = None
+        self.timer_mode = None
 
         # local backup log
         self.log_file = self._create_log_file()
@@ -82,10 +85,12 @@ class ExperimentMarkerGUI:
         self.custom_event_var = tk.StringVar()
         self.note_var = tk.StringVar()
         self.session_phase = "idle"
+        self.workflow_phase = "no_participant"
 
         self.briefing_active = False
         self.baseline_active = False
         self.notes_file = None
+        self.current_trial_started = False
 
         self._build_ui()
 
@@ -227,6 +232,19 @@ class ExperimentMarkerGUI:
         self.notes_entry.pack(fill="x")
         self.notes_entry.bind("<Return>", self.save_note_from_enter)
 
+        reset_frame = ttk.LabelFrame(main, text="Reset Controls", padding=10)
+        reset_frame.pack(fill="x", pady=(0, 10))
+
+        self.reset_briefing_btn = ttk.Button(reset_frame, text="Reset Briefing", command=self.reset_briefing)
+        self.reset_briefing_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        self.reset_baseline_btn = ttk.Button(reset_frame, text="Reset Baseline", command=self.reset_baseline)
+        self.reset_baseline_btn.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.reset_trial_btn = ttk.Button(reset_frame, text="Reset Trial", command=self.reset_trial)
+        self.reset_trial_btn.grid(row=0, column=2, padx=5, pady=5, sticky="ew")
+
+        for i in range(3):
+            reset_frame.columnconfigure(i, weight=1)
+
         # Status / log
         status_frame = ttk.LabelFrame(main, text="Status", padding=10)
         status_frame.pack(fill="both", expand=True)
@@ -237,8 +255,7 @@ class ExperimentMarkerGUI:
         self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(state="disabled")
 
-        self._set_trial_button_states()
-        self._set_general_button_states()
+        self._refresh_button_states()
 
     # -----------------------------
     # Utility
@@ -271,26 +288,34 @@ class ExperimentMarkerGUI:
         seconds = total_seconds % 60
         return f"{minutes:02d}:{seconds:02d}"
 
-    def _set_trial_button_states(self) -> None:
-        participant_loaded = self.participant_id is not None
-        more_trials_available = participant_loaded and self.current_trial_index < 4
+    def _refresh_button_states(self) -> None:
+        briefing_start_enabled = self.workflow_phase == "await_briefing_start"
+        briefing_end_enabled = self.workflow_phase == "briefing_active"
+        baseline_start_enabled = self.workflow_phase == "await_baseline_start"
+        baseline_end_enabled = self.workflow_phase == "baseline_active"
+        trial_start_enabled = self.workflow_phase == "await_trial_start"
+        in_trial = self.workflow_phase == "trial_active"
+        reset_briefing_enabled = self.workflow_phase == "briefing_active" and self.briefing_active
+        reset_baseline_enabled = self.workflow_phase == "baseline_active" and self.baseline_active
+        reset_trial_enabled = self.workflow_phase == "trial_active" and self.trial_active and self.current_trial_started
 
-        if self.trial_active:
-            self.trial_start_btn.config(state="disabled")
-            self.leak_check_end_btn.config(state="normal")
-            self.visual_inspection_end_btn.config(state="normal")
-            self.trial_end_btn.config(state="normal")
-        else:
-            self.trial_start_btn.config(state="normal" if more_trials_available else "disabled")
-            self.leak_check_end_btn.config(state="disabled")
-            self.visual_inspection_end_btn.config(state="disabled")
-            self.trial_end_btn.config(state="disabled")
+        self.briefing_start_btn.config(state="normal" if briefing_start_enabled else "disabled")
+        self.briefing_end_btn.config(state="normal" if briefing_end_enabled else "disabled")
+        self.baseline_start_btn.config(state="normal" if baseline_start_enabled else "disabled")
+        self.baseline_end_btn.config(state="normal" if baseline_end_enabled else "disabled")
 
-    def _set_general_button_states(self) -> None:
-        self.briefing_start_btn.config(state="disabled" if self.briefing_active else "normal")
-        self.briefing_end_btn.config(state="normal" if self.briefing_active else "disabled")
-        self.baseline_start_btn.config(state="disabled" if self.baseline_active else "normal")
-        self.baseline_end_btn.config(state="normal" if self.baseline_active else "disabled")
+        self.trial_start_btn.config(state="normal" if trial_start_enabled else "disabled")
+        self.leak_check_end_btn.config(state="normal" if in_trial else "disabled")
+        self.visual_inspection_end_btn.config(state="normal" if in_trial else "disabled")
+        self.trial_end_btn.config(state="normal" if in_trial else "disabled")
+        self.reset_briefing_btn.config(state="normal" if reset_briefing_enabled else "disabled")
+        self.reset_baseline_btn.config(state="normal" if reset_baseline_enabled else "disabled")
+        self.reset_trial_btn.config(state="normal" if reset_trial_enabled else "disabled")
+
+    def _current_baseline_tag(self) -> str:
+        if self.current_trial_index < 4:
+            return f"pre_t{self.current_trial_index + 1}"
+        return "post_t4"
 
     def _get_current_trial_info(self):
         if self.participant_id is None or self.current_trial_index >= 4:
@@ -309,8 +334,29 @@ class ExperimentMarkerGUI:
 
     def update_trial_display(self) -> None:
         info = self._get_current_trial_info()
+        if self.participant_id is None:
+            self.current_trial_var.set("Step: Participant Not Loaded")
+            self.time_var.set("Allocated Time: -")
+            self.elbow_var.set("Configuration: -")
+            if not self.trial_active:
+                self.timer_var.set("00:00")
+            return
+
+        if self.workflow_phase in {"await_briefing_start", "briefing_active"}:
+            self.current_trial_var.set("Step: Briefing")
+            self.time_var.set("Allocated Time: -")
+            self.elbow_var.set("Configuration: -")
+            return
+
+        if self.workflow_phase in {"await_baseline_start", "baseline_active"}:
+            tag = self._current_baseline_tag()
+            self.current_trial_var.set(f"Step: Baseline ({tag})")
+            self.time_var.set("Allocated Time: 2 minutes")
+            self.elbow_var.set("Configuration: -")
+            return
+
         if info is None:
-            self.current_trial_var.set("Trial: Completed / Not Loaded")
+            self.current_trial_var.set("Step: Completed")
             self.time_var.set("Allocated Time: -")
             self.elbow_var.set("Configuration: -")
             if not self.trial_active:
@@ -349,14 +395,15 @@ class ExperimentMarkerGUI:
         self.trial_active = False
         self.briefing_active = False
         self.baseline_active = False
+        self.current_trial_started = False
+        self.workflow_phase = "await_briefing_start"
         self.notes_file = self._prepare_notes_file(pid)
 
         self.participant_status_var.set(
             f"Participant {pid} loaded. Trial order: {self.trial_sequence}"
         )
         self.update_trial_display()
-        self._set_trial_button_states()
-        self._set_general_button_states()
+        self._refresh_button_states()
 
         self.send_marker(f"participant_loaded_p{pid}")
         self.log_message(f"Loaded participant {pid} with trial order {self.trial_sequence}")
@@ -365,36 +412,86 @@ class ExperimentMarkerGUI:
     # General events
     # -----------------------------
     def briefing_start(self) -> None:
-        if self.briefing_active:
+        if self.workflow_phase != "await_briefing_start":
             return
         self.briefing_active = True
+        self.workflow_phase = "briefing_active"
         self.session_phase = "briefing"
-        self._set_general_button_states()
+        self._refresh_button_states()
+        self.update_trial_display()
         self.general_event("briefing_start")
 
     def briefing_end(self) -> None:
-        if not self.briefing_active:
+        if self.workflow_phase != "briefing_active":
             return
         self.briefing_active = False
-        self.session_phase = "idle"
-        self._set_general_button_states()
+        self.workflow_phase = "await_baseline_start"
+        self.session_phase = "awaiting_baseline"
+        self._refresh_button_states()
+        self.update_trial_display()
         self.general_event("briefing_end")
 
+    def reset_briefing(self) -> None:
+        if self.workflow_phase != "briefing_active" or not self.briefing_active:
+            return
+        self.briefing_active = False
+        self.workflow_phase = "await_briefing_start"
+        self.session_phase = "awaiting_briefing"
+        self.general_event("briefing_reset")
+        self.log_message("Briefing reset. You can start briefing again.")
+        self._refresh_button_states()
+        self.update_trial_display()
+
     def baseline_start(self) -> None:
-        if self.baseline_active:
+        if self.workflow_phase != "await_baseline_start":
             return
         self.baseline_active = True
-        self.session_phase = "baseline"
-        self._set_general_button_states()
-        self.general_event("baseline_start")
+        self.workflow_phase = "baseline_active"
+        tag = self._current_baseline_tag()
+        self.session_phase = f"baseline_{tag}"
+        self._refresh_button_states()
+        self.update_trial_display()
+        self.general_event(f"baseline_{tag}_start")
+        self.start_timer(BASELINE_SECONDS, mode="baseline")
 
     def baseline_end(self) -> None:
-        if not self.baseline_active:
+        self._end_baseline(auto=False)
+
+    def _end_baseline(self, auto: bool) -> None:
+        if self.workflow_phase != "baseline_active":
             return
+
+        tag = self._current_baseline_tag()
+        end_kind = "auto" if auto else "manual"
+        self.general_event(f"baseline_{tag}_end_{end_kind}")
+
+        self.stop_timer()
         self.baseline_active = False
-        self.session_phase = "idle"
-        self._set_general_button_states()
-        self.general_event("baseline_end")
+
+        if self.current_trial_index < 4:
+            self.workflow_phase = "await_trial_start"
+            self.session_phase = f"awaiting_trial_t{self.current_trial_index + 1}"
+        else:
+            self.workflow_phase = "completed"
+            self.session_phase = "completed"
+            self.log_message("Participant flow completed (including final baseline).")
+            messagebox.showinfo("Participant Complete", "All 4 trials and baselines are complete.")
+
+        self._refresh_button_states()
+        self.update_trial_display()
+
+    def reset_baseline(self) -> None:
+        if self.workflow_phase != "baseline_active" or not self.baseline_active:
+            return
+        tag = self._current_baseline_tag()
+        self.stop_timer()
+        self.baseline_active = False
+        self.workflow_phase = "await_baseline_start"
+        self.session_phase = "awaiting_baseline"
+        self.general_event(f"baseline_{tag}_reset")
+        self.log_message(f"Baseline {tag} reset. You can start baseline again.")
+        self._refresh_button_states()
+        self.update_trial_display()
 
     def general_event(self, event_name: str) -> None:
         if self.participant_id is not None:
@@ -472,6 +569,9 @@ class ExperimentMarkerGUI:
             messagebox.showwarning("No Participant", "Load a participant before starting a trial.")
             return
 
+        if self.workflow_phase != "await_trial_start":
+            return
+
         if self.trial_active:
             messagebox.showinfo("Trial Active", "A trial is already running.")
             return
@@ -482,8 +582,11 @@ class ExperimentMarkerGUI:
             return
 
         self.trial_active = True
+        self.current_trial_started = True
+        self.workflow_phase = "trial_active"
         self.session_phase = f"trial_t{info['trial_number']}_leak_check"
-        self._set_trial_button_states()
+        self._refresh_button_states()
+        self.update_trial_display()
 
         trial_num = info["trial_number"]
         option_num = info["option_number"]
@@ -499,7 +602,7 @@ class ExperimentMarkerGUI:
             f"Trial {trial_num} started | option={option_num}, duration={minutes} min, elbows={elbows}"
         )
 
-        self.start_timer(minutes * 60)
+        self.start_timer(minutes * 60, mode="trial")
 
     def leak_check_end(self) -> None:
         if not self.trial_active:
@@ -547,22 +650,45 @@ class ExperimentMarkerGUI:
 
         self.stop_timer()
         self.trial_active = False
-        self.session_phase = "idle"
+        self.current_trial_started = False
+        self.workflow_phase = "await_baseline_start"
+        self.session_phase = "awaiting_baseline"
         self.current_trial_index += 1
 
         self.update_trial_display()
-        self._set_trial_button_states()
+        self._refresh_button_states()
 
         if self.current_trial_index >= 4:
-            self.log_message("All trials completed for this participant.")
-            messagebox.showinfo("Participant Complete", "All 4 trials are complete.")
+            self.log_message("Trial 4 complete. Run final 2-minute baseline to finish participant flow.")
+
+    def reset_trial(self) -> None:
+        if self.workflow_phase != "trial_active" or not self.trial_active:
+            return
+
+        info = self._get_current_trial_info()
+        if info is None:
+            return
+
+        trial_num = info["trial_number"]
+        option_num = info["option_number"]
+
+        self.stop_timer()
+        self.trial_active = False
+        self.current_trial_started = False
+        self.workflow_phase = "await_trial_start"
+        self.session_phase = f"awaiting_trial_t{trial_num}"
+        self.send_marker(f"p{self.participant_id}_trial_reset_t{trial_num}_option{option_num}")
+        self.log_message(f"Trial {trial_num} reset. You can start this trial again.")
+        self.update_trial_display()
+        self._refresh_button_states()
 
     # -----------------------------
     # Timer
     # -----------------------------
-    def start_timer(self, seconds: int) -> None:
+    def start_timer(self, seconds: int, mode: str) -> None:
         self.stop_timer()
         self.remaining_seconds = max(0, int(seconds))
+        self.timer_mode = mode
         self.timer_var.set(self._format_mmss(self.remaining_seconds))
         self.timer_running = True
         self._tick_timer()
@@ -572,6 +698,7 @@ class ExperimentMarkerGUI:
         if self.timer_job is not None:
             self.root.after_cancel(self.timer_job)
             self.timer_job = None
+        self.timer_mode = None
 
     def _tick_timer(self) -> None:
         if not self.timer_running:
@@ -582,8 +709,14 @@ class ExperimentMarkerGUI:
         if self.remaining_seconds <= 0:
             self.timer_running = False
             self.timer_job = None
-            self.log_message("Timer reached 00:00. Ending trial automatically.")
-            self._end_trial(auto=True)
+            timer_mode = self.timer_mode
+            self.timer_mode = None
+            if timer_mode == "trial":
+                self.log_message("Timer reached 00:00. Ending trial automatically.")
+                self._end_trial(auto=True)
+            elif timer_mode == "baseline":
+                self.log_message("Timer reached 00:00. Ending baseline automatically.")
+                self._end_baseline(auto=True)
             return
 
         self.remaining_seconds -= 1
