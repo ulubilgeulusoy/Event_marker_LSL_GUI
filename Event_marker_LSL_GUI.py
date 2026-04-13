@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 from pylsl import StreamInfo, StreamOutlet, local_clock
+import pyttsx3
 
 
 # -----------------------------
@@ -91,6 +92,10 @@ class ExperimentMarkerGUI:
         self.baseline_active = False
         self.notes_file = None
         self.current_trial_started = False
+        self.trial_step = None
+        self.trial_alert_checkpoints = {}
+        self.announced_time_alerts = set()
+        self.voice_engine = self._init_voice_engine()
 
         self._build_ui()
 
@@ -288,6 +293,48 @@ class ExperimentMarkerGUI:
         seconds = total_seconds % 60
         return f"{minutes:02d}:{seconds:02d}"
 
+    def _init_voice_engine(self):
+        try:
+            engine = pyttsx3.init()
+            return engine
+        except Exception as exc:
+            self.log_message(f"Voice engine unavailable: {exc}")
+            return None
+
+    def _speak(self, text: str) -> None:
+        if self.voice_engine is None:
+            return
+        try:
+            self.voice_engine.say(text)
+            self.voice_engine.runAndWait()
+        except Exception as exc:
+            self.log_message(f"Voice notification failed: {exc}")
+
+    def _set_trial_alert_checkpoints(self, trial_duration_minutes: int) -> None:
+        if trial_duration_minutes >= 30:
+            minute_checkpoints = [20, 10, 5, 1]
+        else:
+            minute_checkpoints = [10, 5, 1]
+
+        self.trial_alert_checkpoints = {
+            minutes * 60: f"{minutes} minute{'s' if minutes != 1 else ''} remaining"
+            for minutes in minute_checkpoints
+            if minutes < trial_duration_minutes
+        }
+        self.announced_time_alerts.clear()
+
+    def _maybe_announce_trial_time_remaining(self) -> None:
+        if self.timer_mode != "trial" or not self.trial_alert_checkpoints:
+            return
+
+        message = self.trial_alert_checkpoints.get(self.remaining_seconds)
+        if message is None or self.remaining_seconds in self.announced_time_alerts:
+            return
+
+        self.announced_time_alerts.add(self.remaining_seconds)
+        self.log_message(f"Audio cue: {message}")
+        self._speak(message)
+
     def _refresh_button_states(self) -> None:
         briefing_start_enabled = self.workflow_phase == "await_briefing_start"
         briefing_end_enabled = self.workflow_phase == "briefing_active"
@@ -295,6 +342,8 @@ class ExperimentMarkerGUI:
         baseline_end_enabled = self.workflow_phase == "baseline_active"
         trial_start_enabled = self.workflow_phase == "await_trial_start"
         in_trial = self.workflow_phase == "trial_active"
+        leak_check_end_enabled = in_trial and self.trial_step == "leak_check"
+        visual_inspection_end_enabled = in_trial and self.trial_step == "visual_inspection"
         reset_briefing_enabled = self.workflow_phase == "briefing_active" and self.briefing_active
         reset_baseline_enabled = self.workflow_phase == "baseline_active" and self.baseline_active
         reset_trial_enabled = self.workflow_phase == "trial_active" and self.trial_active and self.current_trial_started
@@ -305,8 +354,8 @@ class ExperimentMarkerGUI:
         self.baseline_end_btn.config(state="normal" if baseline_end_enabled else "disabled")
 
         self.trial_start_btn.config(state="normal" if trial_start_enabled else "disabled")
-        self.leak_check_end_btn.config(state="normal" if in_trial else "disabled")
-        self.visual_inspection_end_btn.config(state="normal" if in_trial else "disabled")
+        self.leak_check_end_btn.config(state="normal" if leak_check_end_enabled else "disabled")
+        self.visual_inspection_end_btn.config(state="normal" if visual_inspection_end_enabled else "disabled")
         self.trial_end_btn.config(state="normal" if in_trial else "disabled")
         self.reset_briefing_btn.config(state="normal" if reset_briefing_enabled else "disabled")
         self.reset_baseline_btn.config(state="normal" if reset_baseline_enabled else "disabled")
@@ -396,6 +445,7 @@ class ExperimentMarkerGUI:
         self.briefing_active = False
         self.baseline_active = False
         self.current_trial_started = False
+        self.trial_step = None
         self.workflow_phase = "await_briefing_start"
         self.notes_file = self._prepare_notes_file(pid)
 
@@ -583,6 +633,8 @@ class ExperimentMarkerGUI:
 
         self.trial_active = True
         self.current_trial_started = True
+        self.trial_step = "leak_check"
+        self._set_trial_alert_checkpoints(info["minutes"])
         self.workflow_phase = "trial_active"
         self.session_phase = f"trial_t{info['trial_number']}_leak_check"
         self._refresh_button_states()
@@ -608,18 +660,24 @@ class ExperimentMarkerGUI:
         if not self.trial_active:
             messagebox.showwarning("No Active Trial", "Start a trial first.")
             return
+        if self.trial_step != "leak_check":
+            return
 
         info = self._get_current_trial_info()
         if info is None:
             return
 
         marker = f"p{self.participant_id}_leak_check_end_t{info['trial_number']}"
+        self.trial_step = "visual_inspection"
         self.session_phase = f"trial_t{info['trial_number']}_visual_inspection"
         self.send_marker(marker)
+        self._refresh_button_states()
 
     def visual_inspection_end(self) -> None:
         if not self.trial_active:
             messagebox.showwarning("No Active Trial", "Start a trial first.")
+            return
+        if self.trial_step != "visual_inspection":
             return
 
         info = self._get_current_trial_info()
@@ -627,8 +685,10 @@ class ExperimentMarkerGUI:
             return
 
         marker = f"p{self.participant_id}_visual_inspection_end_t{info['trial_number']}"
+        self.trial_step = "reporting"
         self.session_phase = f"trial_t{info['trial_number']}_reporting"
         self.send_marker(marker)
+        self._refresh_button_states()
 
     def end_trial_manual(self) -> None:
         self._end_trial(auto=False)
@@ -651,6 +711,9 @@ class ExperimentMarkerGUI:
         self.stop_timer()
         self.trial_active = False
         self.current_trial_started = False
+        self.trial_step = None
+        self.trial_alert_checkpoints = {}
+        self.announced_time_alerts.clear()
         self.workflow_phase = "await_baseline_start"
         self.session_phase = "awaiting_baseline"
         self.current_trial_index += 1
@@ -675,6 +738,9 @@ class ExperimentMarkerGUI:
         self.stop_timer()
         self.trial_active = False
         self.current_trial_started = False
+        self.trial_step = None
+        self.trial_alert_checkpoints = {}
+        self.announced_time_alerts.clear()
         self.workflow_phase = "await_trial_start"
         self.session_phase = f"awaiting_trial_t{trial_num}"
         self.send_marker(f"p{self.participant_id}_trial_reset_t{trial_num}_option{option_num}")
@@ -704,6 +770,7 @@ class ExperimentMarkerGUI:
         if not self.timer_running:
             return
 
+        self._maybe_announce_trial_time_remaining()
         self.timer_var.set(self._format_mmss(self.remaining_seconds))
 
         if self.remaining_seconds <= 0:
