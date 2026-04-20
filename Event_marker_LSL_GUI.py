@@ -184,13 +184,6 @@ class ExperimentMarkerGUI:
         timer_frame.pack(fill="x", pady=(0, 10))
 
         ttk.Label(timer_frame, textvariable=self.timer_var, font=("Arial", 28, "bold")).pack(anchor="center", pady=5)
-        speed_row = ttk.Frame(timer_frame)
-        speed_row.pack(anchor="center", pady=(0, 2))
-        ttk.Label(speed_row, text="Timer Speed (test):").pack(side="left", padx=(0, 6))
-        ttk.Button(speed_row, text="1x", command=lambda: self.set_timer_speed(1.0)).pack(side="left", padx=2)
-        ttk.Button(speed_row, text="5x", command=lambda: self.set_timer_speed(5.0)).pack(side="left", padx=2)
-        ttk.Button(speed_row, text="10x", command=lambda: self.set_timer_speed(10.0)).pack(side="left", padx=2)
-        ttk.Button(speed_row, text="50x", command=lambda: self.set_timer_speed(50.0)).pack(side="left", padx=2)
 
         # General event buttons
         general_frame = ttk.LabelFrame(main, text="General Events", padding=10)

@@ -26,7 +26,7 @@ A Python Tkinter GUI that sends manual experiment event markers over LSL while c
     - After Leak Check End: Visual Inspection End + Trial End enabled
 - Trial timer starts on trial start.
 - Trial auto-ends (and sends marker) when timer reaches `00:00` if not manually ended.
-- Trial audio notifications (offline TTS via `pyttsx3`) announce remaining time once at checkpoints:
+- Trial audio notifications announce remaining time once at checkpoints:
   - 15-minute trials: 10, 5, and 1 minute remaining
   - 30-minute trials: 20, 10, 5, and 1 minute remaining
 - Baseline timer starts on baseline start and auto-ends at `00:00` if not manually ended.
@@ -71,6 +71,23 @@ Columns:
 ## Notes
 
 - `tkinter` is part of standard Python on most desktop installs.
-- Spoken time notifications use `pyttsx3` and your local OS voice engine.
+- The app sets `LSLAPICFG` to the project `lsl_api.cfg` so benign liblsl multicast warnings are suppressed.
+- Spoken notifications use Windows SAPI via PowerShell first, with `pyttsx3` as fallback.
 - Make sure your LabRecorder is running and recording the marker stream together with your other LSL streams.
 - LSL markers cannot be deleted after being sent; reset actions send compensating reset markers so aborted attempts can be excluded during analysis.
+
+## Troubleshooting
+
+- If liblsl prints multicast bind warnings for `::1`, confirm `lsl_api.cfg` exists at repo root and includes:
+  - `[log]`
+  - `level = -2`
+- If time cues seem missing, check the on-screen log sequence at a checkpoint:
+  - `Audio cue: ...`
+  - `Audio queued: ...`
+  - `Audio played: ...`
+- Timer reliability changes:
+  - Countdown uses monotonic clock timing (less drift under UI load).
+  - Checkpoints are crossing-based, so a cue still triggers even if exact second boundaries are skipped.
+- Hidden timer-speed logic (kept for verification/validation, not shown in GUI):
+  - The method `set_timer_speed(speed)` still exists in `Event_marker_LSL_GUI.py`.
+  - You can set `self.timer_speed` (or call `self.set_timer_speed(...)`) in code for accelerated dry-runs (for example `10.0` or `50.0`), then restore to `1.0` for real sessions.
