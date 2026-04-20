@@ -1,8 +1,16 @@
 import csv
 import os
+import math
+import queue
+import subprocess
+import threading
+import time
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
+
+# Force liblsl to use the project-local config (silences benign multicast warnings on loopback).
+os.environ.setdefault("LSLAPICFG", os.path.join(os.path.dirname(__file__), "lsl_api.cfg"))
 
 from pylsl import StreamInfo, StreamOutlet, local_clock
 import pyttsx3
@@ -69,6 +77,9 @@ class ExperimentMarkerGUI:
         self.remaining_seconds = 0
         self.timer_job = None
         self.timer_mode = None
+        self.timer_end_monotonic = None
+        self.last_remaining_seconds = None
+        self.timer_speed = 1.0
 
         # local backup log
         self.log_file = self._create_log_file()
@@ -95,7 +106,9 @@ class ExperimentMarkerGUI:
         self.trial_step = None
         self.trial_alert_checkpoints = {}
         self.announced_time_alerts = set()
-        self.voice_engine = self._init_voice_engine()
+        self.voice_queue = queue.Queue()
+        self.voice_thread = None
+        self._init_voice_engine()
 
         self._build_ui()
 
@@ -171,6 +184,13 @@ class ExperimentMarkerGUI:
         timer_frame.pack(fill="x", pady=(0, 10))
 
         ttk.Label(timer_frame, textvariable=self.timer_var, font=("Arial", 28, "bold")).pack(anchor="center", pady=5)
+        speed_row = ttk.Frame(timer_frame)
+        speed_row.pack(anchor="center", pady=(0, 2))
+        ttk.Label(speed_row, text="Timer Speed (test):").pack(side="left", padx=(0, 6))
+        ttk.Button(speed_row, text="1x", command=lambda: self.set_timer_speed(1.0)).pack(side="left", padx=2)
+        ttk.Button(speed_row, text="5x", command=lambda: self.set_timer_speed(5.0)).pack(side="left", padx=2)
+        ttk.Button(speed_row, text="10x", command=lambda: self.set_timer_speed(10.0)).pack(side="left", padx=2)
+        ttk.Button(speed_row, text="50x", command=lambda: self.set_timer_speed(50.0)).pack(side="left", padx=2)
 
         # General event buttons
         general_frame = ttk.LabelFrame(main, text="General Events", padding=10)
@@ -293,22 +313,68 @@ class ExperimentMarkerGUI:
         seconds = total_seconds % 60
         return f"{minutes:02d}:{seconds:02d}"
 
+    def _compute_remaining_seconds(self) -> int:
+        if self.timer_end_monotonic is None:
+            return self.remaining_seconds
+        real_seconds_left = max(0.0, self.timer_end_monotonic - time.monotonic())
+        experiment_seconds_left = real_seconds_left * self.timer_speed
+        return max(0, int(math.ceil(experiment_seconds_left)))
+
+    def set_timer_speed(self, speed: float) -> None:
+        speed = max(0.1, float(speed))
+        if self.timer_running and self.timer_end_monotonic is not None:
+            remaining = self._compute_remaining_seconds()
+            self.timer_speed = speed
+            self.timer_end_monotonic = time.monotonic() + (remaining / self.timer_speed)
+            self.remaining_seconds = remaining
+            self.timer_var.set(self._format_mmss(self.remaining_seconds))
+            self.log_message(f"Timer speed set to {self.timer_speed:g}x")
+            return
+
+        self.timer_speed = speed
+        self.log_message(f"Timer speed set to {self.timer_speed:g}x")
+
     def _init_voice_engine(self):
-        try:
-            engine = pyttsx3.init()
-            return engine
-        except Exception as exc:
-            self.log_message(f"Voice engine unavailable: {exc}")
-            return None
+        self.voice_thread = threading.Thread(target=self._voice_worker, daemon=True)
+        self.voice_thread.start()
+
+    def _voice_worker(self) -> None:
+        while True:
+            text = self.voice_queue.get()
+            if text is None:
+                break
+            try:
+                if not self._speak_windows_sapi(text):
+                    # Fallback path if PowerShell speech is unavailable.
+                    engine = pyttsx3.init()
+                    engine.say(text)
+                    engine.runAndWait()
+                    engine.stop()
+                self.root.after(0, lambda text=text: self.log_message(f"Audio played: {text}"))
+            except Exception as exc:
+                err = str(exc)
+                self.root.after(0, lambda err=err: self.log_message(f"Voice notification failed: {err}"))
+
+    def _speak_windows_sapi(self, text: str) -> bool:
+        # Use native Windows speech synthesis in a short-lived process for robustness.
+        script = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            "$s.Speak([Console]::In.ReadToEnd()); "
+            "$s.Dispose()"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            input=text,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+        return result.returncode == 0
 
     def _speak(self, text: str) -> None:
-        if self.voice_engine is None:
-            return
-        try:
-            self.voice_engine.say(text)
-            self.voice_engine.runAndWait()
-        except Exception as exc:
-            self.log_message(f"Voice notification failed: {exc}")
+        self.log_message(f"Audio queued: {text}")
+        self.voice_queue.put(text)
 
     def _set_trial_alert_checkpoints(self, trial_duration_minutes: int) -> None:
         if trial_duration_minutes >= 30:
@@ -327,13 +393,25 @@ class ExperimentMarkerGUI:
         if self.timer_mode != "trial" or not self.trial_alert_checkpoints:
             return
 
-        message = self.trial_alert_checkpoints.get(self.remaining_seconds)
-        if message is None or self.remaining_seconds in self.announced_time_alerts:
-            return
+        if self.last_remaining_seconds is None:
+            self.last_remaining_seconds = self.remaining_seconds + 1
 
-        self.announced_time_alerts.add(self.remaining_seconds)
-        self.log_message(f"Audio cue: {message}")
-        self._speak(message)
+        crossed = [
+            checkpoint
+            for checkpoint in self.trial_alert_checkpoints.keys()
+            if checkpoint not in self.announced_time_alerts
+            and self.last_remaining_seconds > checkpoint >= self.remaining_seconds
+        ]
+        for checkpoint in sorted(crossed, reverse=True):
+            message = self.trial_alert_checkpoints[checkpoint]
+            self.announced_time_alerts.add(checkpoint)
+            self.log_message(
+                f"Audio cue: {message} "
+                f"(checkpoint={checkpoint}s, now={self.remaining_seconds}s)"
+            )
+            self._speak(message)
+
+        self.last_remaining_seconds = self.remaining_seconds
 
     def _refresh_button_states(self) -> None:
         briefing_start_enabled = self.workflow_phase == "await_briefing_start"
@@ -755,6 +833,8 @@ class ExperimentMarkerGUI:
         self.stop_timer()
         self.remaining_seconds = max(0, int(seconds))
         self.timer_mode = mode
+        self.timer_end_monotonic = time.monotonic() + (self.remaining_seconds / self.timer_speed)
+        self.last_remaining_seconds = self.remaining_seconds + 1
         self.timer_var.set(self._format_mmss(self.remaining_seconds))
         self.timer_running = True
         self._tick_timer()
@@ -765,10 +845,14 @@ class ExperimentMarkerGUI:
             self.root.after_cancel(self.timer_job)
             self.timer_job = None
         self.timer_mode = None
+        self.timer_end_monotonic = None
+        self.last_remaining_seconds = None
 
     def _tick_timer(self) -> None:
         if not self.timer_running:
             return
+
+        self.remaining_seconds = self._compute_remaining_seconds()
 
         self._maybe_announce_trial_time_remaining()
         self.timer_var.set(self._format_mmss(self.remaining_seconds))
@@ -786,14 +870,14 @@ class ExperimentMarkerGUI:
                 self._end_baseline(auto=True)
             return
 
-        self.remaining_seconds -= 1
-        self.timer_job = self.root.after(1000, self._tick_timer)
+        self.timer_job = self.root.after(200, self._tick_timer)
 
     # -----------------------------
     # App lifecycle
     # -----------------------------
     def on_close(self) -> None:
         self.stop_timer()
+        self.voice_queue.put(None)
         try:
             self.send_marker("gui_closed")
         except Exception:
